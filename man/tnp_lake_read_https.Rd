@@ -24,11 +24,11 @@ tnp_lake_read_https(
 
 \item{man}{Manifest list (from \code{tnp_manifest()}).}
 
-\item{state}{Two-letter state (e.g., "NY").}
+\item{state}{Two-letter state (example, "NY").}
 
-\item{initials}{Optional vector of initials to include (e.g., c("S","M")); NULL = all.}
+\item{initials}{Optional vector of initials to include (example, c("S","M")); NULL = all.}
 
-\item{where_sql}{Optional SQL predicate to push down (e.g., "entity_type = 1").}
+\item{where_sql}{Optional SQL predicate to push down (example, "entity_type = 1").}
 
 \item{columns}{Character vector of columns to select.}
 

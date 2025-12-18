@@ -9,7 +9,7 @@ tnp_state_initials(man, state)
 \arguments{
 \item{man}{Manifest list returned by \code{\link[=tnp_manifest]{tnp_manifest()}}.}
 
-\item{state}{Two-letter state code (e.g., "NY").}
+\item{state}{Two-letter state code (for example "NY").}
 }
 \value{
 A character vector of initials present in the lake for that state.

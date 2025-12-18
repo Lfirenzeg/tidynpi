@@ -1,6 +1,7 @@
 #' Fetch the NPPES manifest (JSON)
 #' @param use_latest logical; if TRUE, resolve latest.txt first.
 #' @return a named list with $snapshot, $base_url, $states
+#' @export
 tnp_manifest <- function(use_latest = FALSE) {
   man_url <- if (use_latest) {
     latest <- httr2::request(tnp_latest_url()) |> httr2::req_perform() |> httr2::resp_body_string()

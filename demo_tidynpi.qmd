@@ -51,11 +51,11 @@ options(width = 120)
 # remotes::install_github("Lfirenzeg/tidynpi")
 
 # Option 2: Load installed package from GitHub
-# library(tidynpi)
-# cat("✓ Loaded tidynpi from GitHub installation\n")
+ library(tidynpi)
+ cat("✓ Loaded tidynpi from GitHub installation\n")
 
 # Option 3: Load from local development directory (this code is here as reference to show what was used during package development)
-use_dev <- TRUE
+use_dev <- FALSE
 pkg_dir <- "C:/Users/lucho/OneDrive/Documents/698/tidynpi"
 
 if (use_dev) {
@@ -63,7 +63,7 @@ if (use_dev) {
     install.packages("devtools")
   }
   devtools::load_all(pkg_dir)
-  cat("✓ Loaded tidynpi from development directory\n")
+  cat("Loaded tidynpi from development directory\n")
 }
 
 # Load supporting packages
@@ -124,7 +124,7 @@ inputs <- demo |>
   filter(!is.na(full_name) & full_name != "", !is.na(state) & state != "") |>
   distinct()
 
-cat("✓ Loaded", nrow(inputs), "unique input records from GitHub\n")
+cat("Loaded", nrow(inputs), "unique input records from GitHub\n")
 ```
 
 ## Sample Data for Quick Demo

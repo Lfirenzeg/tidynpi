@@ -18,7 +18,7 @@ tnp_lake_read(
 
 \item{man}{manifest list}
 
-\item{state}{2-letter code (e.g., "NY")}
+\item{state}{2-letter code (for example "NY")}
 
 \item{initials}{optional initials vector to prune shards}
 

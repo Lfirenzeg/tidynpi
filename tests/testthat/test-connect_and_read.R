@@ -1,0 +1,11 @@
+test_that("duckdb connects and can read a single file", {
+  skip_on_cran()
+  con <- tnp_duckdb(); on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  man <- tnp_manifest()
+  urls <- tnp_urls(man, "NY", initials = "S")
+  sql <- sprintf("SELECT COUNT(*) AS n FROM parquet_scan(['%s'])", urls[1])
+  res <- DBI::dbGetQuery(con, sql)
+  expect_s3_class(res, "data.frame")
+  expect_true("n" %in% names(res))
+  expect_gt(res$n[1], 0)
+})

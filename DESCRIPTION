@@ -1,0 +1,30 @@
+Package: tidynpi
+Title: Efficient NPPES Provider Lookup via Parquet Lake and DuckDB
+Version: 0.0.0.9000
+Authors@R: 
+    person("Luis","Muñoz Grass", role = c("aut","cre"),
+           email = "luisfernando.mg21@gmail.com")
+Description: Lookup, enrich, and match NPPES provider data via a hosted Parquet 
+    snapshot accessible over HTTPS. Uses DuckDB for efficient columnar reads with 
+    pushdown filters, Jaro-Winkler similarity for name matching, and provides 
+    taxonomy code translation for human-readable provider specialties.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+Language: en-US
+Imports:
+    DBI,
+    duckdb,
+    dplyr,
+    jsonlite,
+    httr2,
+    cli,
+    stringi,
+    stringdist,
+    utils
+Suggests:
+    testthat (>= 3.0.0),
+    purrr,
+    readr
+Config/testthat/edition: 3

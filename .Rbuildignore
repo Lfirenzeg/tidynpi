@@ -1,0 +1,11 @@
+^tidynpi\.Rproj$
+^\.Rproj\.user$
+^LICENSE\.md$
+^README\.Rmd$
+^demo_tidynpi\.qmd$
+^\.github$
+^_pkgdown\.yml$
+^docs$
+^\.git$
+^\.gitignore$
+^pkgdown$

@@ -1,0 +1,886 @@
+---
+title: "tidynpi Demo: NPPES Data Lookup in R"
+subtitle: "Efficient Provider Matching via Parquet Lake"
+author: "LFMG"
+date: "`r Sys.Date()`"
+format:
+  html:
+    code-fold: show
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    df-print: paged
+execute:
+  warning: false
+  message: true
+  echo: true
+---
+
+::: callout-note
+## What This Demo Demonstrates
+
+This document showcases the **tidynpi** package, which:
+
+-   Makes use of a **manifest of partitioned NPPES parquet files**
+-   Is capable of **efficient name matching** using Jaro-Winkler similarity
+-   Completes **selective reads** with DuckDB's pushdown filters
+-   Has **public HTTPS access** to hosted data lake (no credentials required)
+-   Includes a **reproducible workflow** with version-pinned snapshots
+
+**Workflow**: Load inputs -\> Connect to parquet lake -\> Run enrichment -\> Analyze results
+:::
+
+# Setup and Configuration
+
+## Package Loading
+
+```{r}
+#| label: setup
+#| code-summary: "Load packages and configure environment"
+
+options(width = 120)
+
+# ==============================================================================
+# INSTALLATION & LOADING OPTIONS
+# ==============================================================================
+
+# Option 1: Install from GitHub (FIRST TIME ONLY - uncomment to run)
+# if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+# remotes::install_github("Lfirenzeg/tidynpi")
+
+# Option 2: Load installed package from GitHub
+# library(tidynpi)
+# cat("✓ Loaded tidynpi from GitHub installation\n")
+
+# Option 3: Load from local development directory (this code is here as reference to show what was used during package development)
+use_dev <- TRUE
+pkg_dir <- "C:/Users/lucho/OneDrive/Documents/698/tidynpi"
+
+if (use_dev) {
+  if (!requireNamespace("devtools", quietly = TRUE)) {
+    install.packages("devtools")
+  }
+  devtools::load_all(pkg_dir)
+  cat("✓ Loaded tidynpi from development directory\n")
+}
+
+# Load supporting packages
+pkgs <- c("dplyr", "readr", "jsonlite", "DBI", "ggplot2", "knitr")
+to_install <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(to_install)) {
+  cat("Installing missing packages:", paste(to_install, collapse = ", "), "\n")
+  install.packages(to_install)
+}
+
+library(dplyr)
+library(readr)
+library(jsonlite)
+library(DBI)
+library(ggplot2)
+library(knitr)
+
+cat("All packages loaded successfully\n")
+```
+
+::: callout-tip
+## Development vs. Installed Package
+
+**Option 1 - GitHub Installation** (Recommended for most users): 1. Uncomment lines for installing from GitHub (first time only) 2. Uncomment `library(tidynpi)` to load the package 3. Comment out or set `use_dev <- FALSE`
+
+**Option 2 - Local Development** (For package developers): 1. Keep `use_dev <- TRUE` 2. Update `pkg_dir` to your local tidynpi directory 3. Uses `devtools::load_all()` for live code updates
+
+**Quick Start After GitHub Upload:**
+
+``` r
+remotes::install_github("Lfirenzeg/tidynpi")  # Once
+library(tidynpi)                               # Every session
+```
+:::
+
+# Load Demo Data
+
+## Fetch Sample Inputs from GitHub
+
+```{r}
+#| label: load-demo-inputs
+#| code-summary: "Download and prepare demo data"
+
+demo_url <- "https://raw.githubusercontent.com/Lfirenzeg/msds698/refs/heads/main/demo_ready.csv"
+
+demo <- readr::read_csv(demo_url, show_col_types = FALSE)
+
+# Verify required columns exist
+stopifnot(all(c("full_name", "state_in", "city_in") %in% names(demo)))
+
+# Prepare inputs: rename columns and filter out missing values
+inputs <- demo |>
+  transmute(
+    full_name = full_name,
+    state = state_in,
+    city  = city_in
+  ) |>
+  filter(!is.na(full_name) & full_name != "", !is.na(state) & state != "") |>
+  distinct()
+
+cat("✓ Loaded", nrow(inputs), "unique input records from GitHub\n")
+```
+
+## Sample Data for Quick Demo
+
+```{r}
+#| label: sample-data
+#| code-summary: "Select random sample for demonstration"
+
+# For a quick demo, sample a smaller batch
+set.seed(893)  # Reproducible sampling
+n_take <- min(50L, nrow(inputs))
+inputs_small <- inputs |> dplyr::slice_sample(n = n_take)
+
+cat("Selected", n_take, "records for demo\n")
+
+# Preview the inputs
+head(inputs_small, 10) |> knitr::kable(caption = "Sample Input Records")
+```
+
+# Connect to NPPES Parquet Lake
+
+## Load Manifest and Establish DuckDB Connection
+
+The manifest is a JSON file that lists all available parquet shards by state and last-name initial.
+
+```{r}
+#| label: connect-lake
+#| code-summary: "Initialize connection to parquet lake"
+
+# Load the manifest from the public CloudFlare R2 bucket
+# This uses the "latest" pointer to always get the most recent snapshot
+cat("Loading manifest from CloudFlare R2 (public HTTPS)...\n")
+
+# Option 1: Use the latest snapshot (recommended)
+man <- tnp_manifest()  # Automatically fetches latest via tnp_latest_url()
+
+# Option 2: Pin to a specific snapshot for reproducibility (uncomment to use)
+# specific_url <- "https://rnppes.org/nppes/2025-10-13/manifest_state_files.json"
+# man <- jsonlite::fromJSON(specific_url, simplifyVector = FALSE)
+
+stopifnot(is.list(man), "states" %in% names(man))
+
+cat("✓ Manifest loaded successfully\n")
+cat("  Available states:", length(man$states), "\n")
+cat("  Data is served from: rnppes.org\n\n")
+
+# Create an in-memory DuckDB connection
+con <- tnp_duckdb(":memory:")
+
+cat("✓ DuckDB connection established\n")
+```
+
+::: callout-note
+## Remote Manifest Loading
+
+**No local files required!** The manifest and all parquet data are served over public HTTPS from CloudFlare R2.
+
+-   **`tnp_manifest()`**: Automatically uses the latest snapshot
+-   **Specific snapshot**: Pin to a date for reproducible research
+-   **No credentials needed**: Completely public access
+
+This makes the demo fully reproducible for anyone without local data setup.
+:::
+
+# Run NPI Enrichment
+
+## Execute Matching with `npi_enrich()`
+
+This is the core function that:
+
+1.  **Normalizes** input names and states
+2.  **Searches** relevant parquet shards
+3.  **Ranks** candidates using Jaro-Winkler similarity
+4.  **Returns** top matches per input
+
+```{r}
+#| label: run-enrich
+#| code-summary: "Run NPI enrichment pipeline"
+
+cat("Running NPI enrichment...\n")
+cat("Strategy: strict (higher precision)\n")
+cat("City mode: prefer (boosts city matches in ranking)\n\n")
+
+system.time({
+  res <- npi_enrich(
+    inputs = inputs_small,
+    con = con,
+    man = man,
+    
+    # Matching strategy
+    strategy = "strict",          # "strict" = JW >= 0.90 | "loose" = JW >= 0.85
+    city_mode = "prefer",         # "ignore" | "prefer" | "require"
+    
+    # Candidate limits
+    max_candidates = 5,           # Maximum candidates returned per input
+    
+    # HTTP/retry parameters
+    max_urls_per_query = 5,       # Batch size for parquet shard reads
+    tries = 2,                    # Retry attempts for HTTP failures
+    initial_wait = 0.2,           # Initial backoff wait (seconds)
+    max_wait = 1,                 # Maximum backoff wait (seconds)
+    sleep_between_batches = 0,    # Sleep between URL batches (seconds)
+    
+    # Progress reporting
+    verbose = TRUE                # Print progress messages
+  )
+})
+
+cat("\nEnrichment complete\n")
+```
+
+```{r}
+#| label: close-connection
+#| code-summary: "Close database connection"
+
+# Always close DB connections when done
+DBI::dbDisconnect(con, shutdown = TRUE)
+cat("DuckDB connection closed\n")
+```
+
+::: callout-tip
+## Strategy Options
+
+-   **`strict`**: More precise (Jaro-Winkler ≥ 0.90), fewer false positives
+-   **`loose`**: More recall (Jaro-Winkler ≥ 0.85), catches variant spellings
+
+**City Mode Options:**
+
+-   **`ignore`**: Match on name + state only
+-   **`prefer`**: Boost ranking if city matches
+-   **`require`**: Only return candidates where city matches exactly
+:::
+
+# Analyze Results
+
+## Inspect Result Structure
+
+```{r}
+#| label: inspect-results
+#| code-summary: "Examine returned data structure"
+
+cat("Result dimensions:", nrow(res), "rows ×", ncol(res), "columns\n\n")
+dplyr::glimpse(res)
+```
+
+## Summary Statistics
+
+```{r}
+#| label: summarize-results
+#| code-summary: "Generate match quality metrics"
+
+if (nrow(res) == 0) {
+  cat(" No matches returned.\n")
+  cat("  Check your manifest path and parquet availability.\n")
+} else {
+  # Get the best match for each input (ranked by strategy)
+  best <- res |>
+    group_by(input_id) |>
+    slice(1) |>
+    ungroup()
+  
+  # Summary statistics
+  cat("========================================\n")
+  cat("MATCH SUMMARY\n")
+  cat("========================================\n")
+  cat("Inputs processed:        ", nrow(inputs_small), "\n")
+  cat("Inputs with matches:     ", dplyr::n_distinct(res$input_id), "\n")
+  cat("Total candidate records: ", nrow(res), "\n")
+  cat("Exact best matches:      ", sum(best$exact_name, na.rm = TRUE), "\n")
+  cat("Perfect JW (1.0) matches:", sum(abs(best$jaro_winkler - 1) < 1e-12, na.rm = TRUE), "\n")
+  cat("========================================\n\n")
+  
+  # Match quality distribution
+  best |>
+    count(rank_label, sort = TRUE, name = "Count") |>
+    mutate(Percentage = sprintf("%.1f%%", Count / sum(Count) * 100)) |>
+    knitr::kable(caption = "Match Quality Distribution (Best Matches)")
+}
+```
+
+## Validate Against Ground Truth NPIs
+
+Since the demo data includes known NPIs, we can validate the matching accuracy:
+
+```{r}
+#| label: validate-npi-matches
+#| code-summary: "Compare matched NPIs against ground truth"
+
+if (nrow(res) > 0) {
+  # Join results with original demo data to get ground truth NPI
+  # First, create a lookup from inputs_small back to original demo
+  inputs_small_with_id <- inputs_small |>
+    mutate(row_num = row_number())
+  
+  # The demo should have an 'NPI' column - let's check and join
+  if ("NPI" %in% names(demo)) {
+    # Create validation dataset
+    validation <- inputs_small |>
+      mutate(input_row = row_number()) |>
+      left_join(
+        demo |>
+          transmute(
+            full_name = full_name,
+            state = state_in,
+            city = city_in,
+            true_npi = NPI
+          ),
+        by = c("full_name", "state", "city")
+      ) |>
+      select(input_row, full_name, state, city, true_npi)
+    
+    # Get best matches
+    best_matches <- res |>
+      group_by(input_id) |>
+      slice(1) |>
+      ungroup() |>
+      select(input_id, npi, jaro_winkler, rank_label, exact_name)
+    
+    # Join validation with best matches
+    validation_results <- validation |>
+      left_join(best_matches, by = c("input_row" = "input_id")) |>
+      mutate(
+        match_status = case_when(
+          is.na(npi) ~ "No Match Found",
+          npi == true_npi ~ "Correct Match",
+          TRUE ~ "Incorrect Match"
+        )
+      )
+    
+    # Calculate accuracy metrics
+    cat("========================================\n")
+    cat("NPI MATCHING ACCURACY\n")
+    cat("========================================\n")
+    cat("Total inputs:           ", nrow(validation_results), "\n")
+    cat("Correct matches:        ", sum(validation_results$match_status == "Correct Match", na.rm = TRUE), "\n")
+    cat("Incorrect matches:      ", sum(validation_results$match_status == "Incorrect Match", na.rm = TRUE), "\n")
+    cat("No match found:         ", sum(validation_results$match_status == "No Match Found", na.rm = TRUE), "\n\n")
+    
+    # Calculate accuracy rate (excluding no matches)
+    found_matches <- validation_results |> filter(match_status != "No Match Found")
+    if (nrow(found_matches) > 0) {
+      accuracy_rate <- sum(found_matches$match_status == "Correct Match") / nrow(found_matches) * 100
+      cat("Accuracy rate (when match found): ", sprintf("%.1f%%", accuracy_rate), "\n")
+    }
+    
+    # Overall accuracy (including no matches as incorrect)
+    overall_accuracy <- sum(validation_results$match_status == "Correct Match") / nrow(validation_results) * 100
+    cat("Overall accuracy:                 ", sprintf("%.1f%%", overall_accuracy), "\n")
+    cat("========================================\n\n")
+    
+    # Show match status distribution
+    validation_results |>
+      count(match_status, sort = TRUE, name = "Count") |>
+      mutate(Percentage = sprintf("%.1f%%", Count / sum(Count) * 100)) |>
+      knitr::kable(caption = "Match Status Distribution")
+    
+  } else {
+    cat("Ground truth NPI column not found in demo data\n")
+  }
+}
+```
+
+```{r}
+#| label: plot-validation-results
+#| code-summary: "Visualize matching accuracy"
+#| fig-width: 8
+#| fig-height: 5
+
+if (nrow(res) > 0 && exists("validation_results")) {
+  # Plot match status
+  match_counts <- validation_results |>
+    count(match_status, sort = TRUE)
+  
+  ggplot(match_counts, aes(x = reorder(match_status, n), y = n)) +
+    geom_col(aes(fill = match_status), alpha = 0.8, show.legend = FALSE) +
+    geom_text(aes(label = n), hjust = -0.2, size = 4) +
+    scale_fill_manual(values = c(
+      "Correct Match" = "#27AE60",
+      "Incorrect Match" = "#E74C3C",
+      "No Match Found" = "#95A5A6"
+    )) +
+    coord_flip() +
+    labs(
+      title = "NPI Matching Validation Results",
+      subtitle = paste0("Total: ", nrow(validation_results), " inputs"),
+      x = NULL,
+      y = "Count"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      panel.grid.major.y = element_blank()
+    )
+}
+```
+
+```{r}
+#| label: analyze-incorrect-matches
+#| code-summary: "Examine incorrect matches for patterns"
+
+if (nrow(res) > 0 && exists("validation_results")) {
+  # Look at incorrect matches to understand why they failed
+  incorrect <- validation_results |>
+    filter(match_status == "Incorrect Match") |>
+    select(full_name, state, city, true_npi, npi, jaro_winkler, rank_label)
+  
+  if (nrow(incorrect) > 0) {
+    cat("Sample of Incorrect Matches:\n\n")
+    incorrect |>
+      head(10) |>
+      knitr::kable(
+        caption = "Examples of Incorrect NPI Matches",
+        col.names = c("Name", "State", "City", "True NPI", "Matched NPI", "JW Score", "Rank")
+      )
+  } else {
+    cat("No incorrect matches found!\n")
+  }
+}
+```
+
+::: callout-note
+## Understanding Validation Results
+
+**Correct Match**: The top-ranked NPI from enrichment exactly matches the ground truth NPI
+
+**Incorrect Match**: A match was found, but the NPI doesn't match the ground truth
+
+**No Match Found**: The enrichment pipeline didn't return any candidates for this input
+
+High accuracy rates validate that the matching pipeline (normalization + Jaro-Winkler + ranking) is working effectively!
+:::
+
+## Visualize Match Quality
+
+```{r}
+#| label: plot-match-quality
+#| code-summary: "Plot Jaro-Winkler score distribution"
+#| fig-width: 10
+#| fig-height: 6
+
+if (nrow(res) > 0) {
+  best <- res |>
+    group_by(input_id) |>
+    slice(1) |>
+    ungroup()
+  
+  # Histogram of Jaro-Winkler scores
+  ggplot(best, aes(x = jaro_winkler)) +
+    geom_histogram(bins = 20, fill = "#2C3E50", color = "white", alpha = 0.8) +
+    geom_vline(xintercept = 0.90, linetype = "dashed", color = "#E74C3C", linewidth = 1) +
+    annotate("text", x = 0.90, y = Inf, label = "Strict threshold (0.90)", 
+             vjust = 2, hjust = -0.1, color = "#E74C3C") +
+    labs(
+      title = "Distribution of Jaro-Winkler Similarity Scores",
+      subtitle = paste0("Best matches (n = ", nrow(best), ")"),
+      x = "Jaro-Winkler Similarity Score",
+      y = "Count"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(color = "gray40")
+    )
+}
+```
+
+```{r}
+#| label: plot-rank-distribution
+#| code-summary: "Plot match rank distribution"
+#| fig-width: 8
+#| fig-height: 5
+
+if (nrow(res) > 0) {
+  rank_counts <- best |>
+    count(rank_label, sort = TRUE)
+  
+  ggplot(rank_counts, aes(x = reorder(rank_label, n), y = n)) +
+    geom_col(fill = "#3498DB", alpha = 0.8) +
+    geom_text(aes(label = n), hjust = -0.2, size = 4) +
+    coord_flip() +
+    labs(
+      title = "Match Quality Categories",
+      subtitle = "Distribution of best matches across quality tiers",
+      x = NULL,
+      y = "Number of Matches"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      panel.grid.major.y = element_blank()
+    )
+}
+```
+
+## Sample of Best Matches
+
+```{r}
+#| label: show-best-matches
+#| code-summary: "Display top matches with details"
+
+if (nrow(res) > 0) {
+  best |>
+    select(
+      input_id,
+      first_norm,
+      last_norm,
+      npi,
+      jaro_winkler,
+      exact_name,
+      rank_label,
+      city_match
+    ) |>
+    arrange(desc(jaro_winkler)) |>
+    head(20) |>
+    knitr::kable(
+      digits = 4,
+      caption = "Top 20 Best Matches (by Jaro-Winkler Score)",
+      col.names = c("ID", "First", "Last", "NPI", "JW Score", "Exact?", "Quality", "City?")
+    )
+}
+```
+
+# Taxonomy Code Translation
+
+## Understanding Provider Taxonomy Codes
+
+One of the key features of **tidynpi** is the ability to translate cryptic NUCC taxonomy codes into human-readable descriptions. The enrichment results include columns like `tax_code_1`, `tax_code_2`, etc., which represent the provider's specialties and classifications.
+
+::: callout-note
+## What are Taxonomy Codes?
+
+The National Uniform Claim Committee (NUCC) maintains a **Healthcare Provider Taxonomy** code set that categorizes the type, classification, and specialization of healthcare providers. Each 10-character code represents a specific provider role.
+
+**Example**: `207Q00000X` = Family Medicine Physician
+:::
+
+## Load Taxonomy Dictionary
+
+The `tnp_taxonomy_dict()` function downloads and caches the official NUCC taxonomy dictionary:
+
+```{r}
+#| label: load-taxonomy
+#| code-summary: "Download and cache taxonomy dictionary"
+
+cat("Loading NUCC taxonomy dictionary...\n")
+tax_dict <- tnp_taxonomy_dict()
+
+cat("Loaded", nrow(tax_dict), "taxonomy codes\n\n")
+
+# Preview the dictionary structure
+head(tax_dict, 10) |>
+  select(code, grouping, classification, specialization, display_name) |>
+  knitr::kable(caption = "Sample Taxonomy Dictionary Entries")
+```
+
+## Translate Taxonomy Codes in Results
+
+Use `tnp_taxonomy_translate()` to automatically add human-readable columns for all taxonomy codes:
+
+```{r}
+#| label: translate-taxonomy
+#| code-summary: "Add taxonomy translations to results"
+
+if (nrow(res) > 0) {
+  # Add taxonomy translations to the results
+  res_with_tax <- tnp_taxonomy_translate(res)
+  
+  cat("Added taxonomy translation columns\n")
+  cat("New columns added:", 
+      paste(grep("^tax_.*_(classification|specialization|display_name)$", 
+                 names(res_with_tax), value = TRUE), collapse = ", "), "\n\n")
+  
+  # Get best matches with taxonomy info
+  best_with_tax <- res_with_tax |>
+    group_by(input_id) |>
+    slice(1) |>
+    ungroup()
+  
+  # Show examples with taxonomy translations
+  best_with_tax |>
+    select(
+      input_id,
+      first_norm,
+      last_norm,
+      npi,
+      tax_code_1,
+      tax_tax_code_1_display_name,
+      tax_code_2,
+      tax_tax_code_2_display_name
+    ) |>
+    head(15) |>
+    knitr::kable(
+      caption = "Provider Matches with Taxonomy Translations",
+      col.names = c("ID", "First", "Last", "NPI", 
+                    "Tax Code 1", "Primary Specialty", 
+                    "Tax Code 2", "Secondary Specialty")
+    )
+}
+```
+
+## Analyze Provider Specialties
+
+```{r}
+#| label: analyze-specialties
+#| code-summary: "Summarize provider specialties"
+
+if (nrow(res) > 0 && exists("best_with_tax")) {
+  # Count primary specialties
+  cat("========================================\n")
+  cat("PRIMARY SPECIALTY DISTRIBUTION\n")
+  cat("========================================\n\n")
+  
+  specialty_counts <- best_with_tax |>
+    filter(!is.na(tax_tax_code_1_display_name)) |>
+    count(tax_tax_code_1_display_name, sort = TRUE, name = "Count") |>
+    head(15)
+  
+  specialty_counts |>
+    mutate(Percentage = sprintf("%.1f%%", Count / sum(Count) * 100)) |>
+    knitr::kable(
+      caption = "Top 15 Primary Specialties in Matched Providers",
+      col.names = c("Primary Specialty", "Count", "Percentage")
+    )
+}
+```
+
+## Visualize Specialty Distribution
+
+```{r}
+#| label: plot-specialties
+#| code-summary: "Plot provider specialty distribution"
+#| fig-width: 10
+#| fig-height: 6
+
+if (nrow(res) > 0 && exists("best_with_tax")) {
+  top_specialties <- best_with_tax |>
+    filter(!is.na(tax_tax_code_1_display_name)) |>
+    count(tax_tax_code_1_display_name, sort = TRUE) |>
+    head(10)
+  
+  if (nrow(top_specialties) > 0) {
+    ggplot(top_specialties, aes(x = reorder(tax_tax_code_1_display_name, n), y = n)) +
+      geom_col(fill = "#27AE60", alpha = 0.8) +
+      geom_text(aes(label = n), hjust = -0.2, size = 3.5) +
+      coord_flip() +
+      labs(
+        title = "Top 10 Provider Specialties",
+        subtitle = "Based on primary taxonomy codes in matched results",
+        x = NULL,
+        y = "Number of Providers"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(face = "bold", size = 14),
+        panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size = 10)
+      )
+  }
+}
+```
+
+## Example: Lookup Individual Taxonomy Codes
+
+You can also look up specific taxonomy codes directly:
+
+```{r}
+#| label: example-lookup-codes
+#| code-summary: "Look up specific taxonomy codes"
+
+# Example taxonomy codes to look up
+example_codes <- c(
+  "207Q00000X",  # Family Medicine
+  "208D00000X",  # General Practice
+  "363L00000X",  # Nurse Practitioner
+  "207R00000X",  # Internal Medicine
+  "2084P0800X"   # Psychiatry & Neurology - Psychiatry
+)
+
+# Look up in dictionary
+tax_dict |>
+  filter(code %in% example_codes) |>
+  select(code, grouping, classification, specialization, display_name) |>
+  knitr::kable(
+    caption = "Example Taxonomy Code Lookups",
+    col.names = c("Code", "Grouping", "Classification", "Specialization", "Display Name")
+  )
+```
+
+::: callout-tip
+## Why Taxonomy Translation Matters
+
+**Without translation**: `tax_code_1 = "207Q00000X"`\
+**With translation**: `Primary Specialty = "Allopathic & Osteopathic Physicians (Family Medicine)"`
+
+This makes it much easier to:
+
+-   Verify you matched the correct provider type
+-   Filter results by specialty
+-   Generate summary reports for stakeholders
+-   Validate data linkage quality
+:::
+
+# Individual Function Examples
+
+## Example 1: Direct `npi_normalize()` Usage
+
+Normalize names and states into search-ready format:
+
+```{r}
+#| label: example-normalize
+#| code-summary: "Normalize individual records"
+
+# Create a small test dataset
+test_inputs <- data.frame(
+  full_name = c("Smith, John", "O'Connor, Mary", "de la Cruz, Carlos"),
+  state = c("NY", "California", "TX"),
+  city = c("New York", "Los Angeles", "Houston"),
+  stringsAsFactors = FALSE
+)
+
+# Normalize the inputs
+normalized <- npi_normalize(
+  inputs = test_inputs,
+  full_name = "full_name",
+  state = "state",
+  city = "city"
+)
+
+normalized |>
+  select(input_id, first_norm, last_norm, state_part, lname_initial, city_norm) |>
+  knitr::kable(caption = "Normalized Inputs")
+```
+
+## Example 2: Understanding Partitioning Keys
+
+The `state_part` and `lname_initial` columns are **blocking keys** used to select relevant parquet shards:
+
+```{r}
+#| label: example-partitioning
+#| code-summary: "Show partitioning logic"
+
+# Show how names map to partitioning keys
+examples <- data.frame(
+  Name = c("Smith", "Zhang", "O'Brien", "#Unknown", "123Test"),
+  Initial = substr(c("SMITH", "ZHANG", "OBRIEN", "#UNKNOWN", "123TEST"), 1, 1),
+  Encoded = c("S", "Z", "O", "%23", "1"),
+  stringsAsFactors = FALSE
+)
+
+examples |>
+  knitr::kable(caption = "Last Name Initial Encoding Examples")
+```
+
+::: callout-note
+## Partitioning Strategy
+
+-   **State**: Each US state + DC + territories + `INTL` catch-all
+-   **Last Name Initial**: A–Z, 0–9, plus encoded specials (`%23` for `#`, `%2F` for `/`, `_` for other)
+
+This creates over 1,500 shards (50 states × 30 initials), enabling **selective reads** of only relevant data.
+:::
+
+# Performance Tips
+
+::: {.callout-tip collapse="true"}
+## Optimizing Enrichment Performance
+
+1.  **Adjust `max_urls_per_query`**
+    -   Increase to 3–5 for faster batch processing\
+    -   Decrease to 1 if hitting rate limits
+2.  **Use `city_mode = "ignore"` when possible**
+    -   Simplifies matching logic\
+    -   City data can be noisy/incomplete
+3.  **Choose strategy wisely**
+    -   Use `"strict"` for high-precision applications\
+    -   Use `"loose"` when you need higher recall
+4.  **Limit `max_candidates`**
+    -   Reduces result size and processing time\
+    -   Set to 1 if you only need the best match
+5.  **Sample inputs for testing**
+    -   Start with 10–50 records during development\
+    -   Scale up once parameters are optimized
+:::
+
+# Troubleshooting
+
+::: {.callout-warning collapse="true"}
+## Common Issues and Solutions
+
+### No matches returned
+
+-   **Check manifest path**: Ensure the path exists and is valid JSON
+-   **Verify parquet availability**: Check that the URLs in the manifest are accessible
+-   **Inspect normalized inputs**: Run `npi_normalize()` separately to verify state/name parsing
+
+### HTTP 429 errors (rate limiting)
+
+-   Increase `initial_wait` and `max_wait`
+-   Decrease `max_urls_per_query` to 1
+-   Add `sleep_between_batches = 0.5`
+
+### Low match quality
+
+-   Try `strategy = "loose"` for more lenient matching
+-   Check input data quality (typos, formatting issues)
+-   Use `city_mode = "ignore"` if city data is unreliable
+
+### Slow performance
+
+-   Increase `max_urls_per_query` to batch more URLs
+-   Reduce `tries` to 2 if network is stable
+-   Limit sample size during testing
+:::
+
+# Cleanup and Export
+
+## Export Results (Optional)
+
+```{r}
+#| label: export-results
+#| code-summary: "Save results to CSV files"
+#| eval: false
+
+# Uncomment to save results
+if (nrow(res) > 0) {
+  best <- res |>
+    group_by(input_id) |>
+    slice(1) |>
+    ungroup()
+  
+  # Export all candidates
+  write_csv(res, "tidynpi_demo_results_all.csv")
+  
+  # Export best matches only
+  write_csv(best, "tidynpi_demo_results_best.csv")
+  
+  cat("✓ Results exported to CSV files\n")
+}
+```
+
+# Session Info
+
+```{r}
+#| label: session-info
+#| code-summary: "Display R session information"
+
+sessionInfo()
+```
+
+------------------------------------------------------------------------
+
+::: callout-note
+## Next Steps
+
+-   Try different `strategy` and `city_mode` combinations
+-   Test with your own input data
+-   Explore the full NPPES dataset (millions of providers!)
+-   Check out the [tidynpi documentation](https://github.com/Lfirenzeg/tidynpi) for more details
+:::

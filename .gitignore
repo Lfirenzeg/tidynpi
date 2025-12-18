@@ -1,0 +1,25 @@
+# RStudio files
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# R build artifacts
+*.tar.gz
+*.Rcheck/
+*.o
+*.so
+*.dll
+
+# macOS files
+.DS_Store
+
+# Rendered output
+*.html
+*.pdf
+demo_tidynpi_files/
+
+# Temporary files
+*~
+*.swp
+*.swo
